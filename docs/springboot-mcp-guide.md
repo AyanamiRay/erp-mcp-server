@@ -1,33 +1,36 @@
-# Spring Boot 接入 MCP Server 实战指南：`@McpTool` 动态注解与自动上报
+# Spring Boot 接入 MCP Server 企业级实战指南 (高阶生产版)
 
-本文档用于指导在现有的 **Java Spring Boot ERP 工程** 中，通过自定义注解 `@McpTool` 实现业务接口的**“开箱即用、启动自动上报、热插拔注册”**到 MCP Server。
+本文档指导在现有的 **Java Spring Boot ERP 工程** 中，通过自定义注解 `@McpTool` 与深度自省组件，实现业务接口的**“开箱即用、JSR-303 与 Swagger 规则深度提取、启动自动注册、关机优雅注销”**。
 
 ---
 
-## 一、 整体交互流程
+## 一、 整体交互架构
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant SpringBoot as Spring Boot ERP 应用
-    participant MCPServer as MCP Server (/admin/tools/batch)
+    participant MCPServer as MCP Server 网关
     participant Client as AI 客户端 (Claude / Cursor / Agent)
 
-    Note over SpringBoot: 容器启动并就绪 (ApplicationReadyEvent)
-    SpringBoot->>SpringBoot: 扫描所有带有 @McpTool 的 Controller 方法
-    SpringBoot->>SpringBoot: 解析 DTO 参数，自动生成 JSON Schema
-    SpringBoot->>MCPServer: HTTP POST 批量注册工具元数据
-    MCPServer->>MCPServer: 写入本地注册表 & 触发 Redis 广播
-    MCPServer-->>Client: 推送 notifications/tools/list_changed
-    Client->>MCPServer: 重新拉取 tools/list (拿到最新工具)
-    Note over Client, SpringBoot: 大模型即可无缝调用该新增的业务工具
+    Note over SpringBoot: 容器启动完毕 (ApplicationReadyEvent)
+    SpringBoot->>SpringBoot: 深度扫描 @McpTool 接口
+    SpringBoot->>SpringBoot: 解析 @Schema、@NotNull、@Size 及 Enum 枚举
+    SpringBoot->>MCPServer: POST /admin/tools/batch (批量注册工具)
+    SpringBoot->>MCPServer: POST /admin/resources (注册业务字典上下文)
+    MCPServer-->>Client: 推送 notifications/tools/list_changed 广播
+    Client->>MCPServer: 自动拉取最新工具定义 (入参约束精准，零幻觉)
+    
+    Note over SpringBoot: 容器正常停机 (ContextClosedEvent)
+    SpringBoot->>MCPServer: DELETE /admin/tools (优雅下线本微服务所有工具)
+    MCPServer-->>Client: 实时广播移除失效工具
 ```
 
 ---
 
-## 二、 Maven 依赖准备
+## 二、 Maven 依赖推荐
 
-确保 Spring Boot 工程具备 Web、Jackson 及可选的 OpenAPI/Swagger 依赖（通常企业级 ERP 已具备）：
+在已有 Spring Boot 工程中，确保包含以下常见组件（若已有无需重复引入）：
 
 ```xml
 <dependencies>
@@ -37,25 +40,27 @@ sequenceDiagram
         <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
 
-    <!-- 参数校验 (JSR-380) -->
+    <!-- JSR-380 参数校验 (用于提取 @NotNull, @Size, @Min 等规则) -->
     <dependency>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
 
-    <!-- Jackson (JSON 序列化与 Schema 解析) -->
+    <!-- 可选: Swagger / SpringDoc (用于自动提取 @Schema 中文字段说明和示例) -->
     <dependency>
-        <groupId>com.fasterxml.jackson.core</groupId>
-        <artifactId>jackson-databind</artifactId>
+        <groupId>io.swagger.core.v3</groupId>
+        <artifactId>swagger-annotations</artifactId>
+        <version>2.2.20</version>
+        <optional>true</optional>
     </dependency>
 </dependencies>
 ```
 
 ---
 
-## 三、 核心代码实现（可直接复制到工程中）
+## 三、 核心实现类源码清单（直接拷贝可用）
 
-建议在 Spring Boot 项目中新建一个包，如 `com.yourcompany.erp.mcp`，放入以下类：
+在项目中新建包名 `com.yourcompany.erp.mcp`：
 
 ### 1. 自定义注解 `@McpTool`
 
@@ -65,7 +70,7 @@ package com.yourcompany.erp.mcp.annotation;
 import java.lang.annotation.*;
 
 /**
- * 标记该 Controller 接口作为 MCP 工具向大模型开放
+ * 声明该 Controller 方法作为 MCP 工具向大模型开放
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
@@ -74,17 +79,17 @@ public @interface McpTool {
 
     /**
      * 工具英文唯一标识（大模型调用的函数名）
-     * 规则：英文、数字、下划线，例如：query_inventory_stock
+     * 规则：英文下划线命名，如 query_erp_inventory
      */
     String name();
 
     /**
-     * 工具功能描述（相当于给 LLM 的 Prompt，需说明清楚什么场景下调用）
+     * 工具功能说明（Prompt），详细描述该工具能做什么、何时调用
      */
     String description();
 
     /**
-     * 工具所属业务分类，默认 common
+     * 所属业务分类，如 inventory, sales, finance
      */
     String category() default "common";
 
@@ -94,8 +99,8 @@ public @interface McpTool {
     int timeoutMs() default 5000;
 
     /**
-     * 裁剪出参字段：只把指定的字段返回给大模型（节约 Token，防止无关字段干扰）
-     * 留空则返回整个响应体
+     * 出参裁剪字段：只把指定的关键字段返回给大模型（节约 Token，防信息污染）
+     * 为空时返回整个响应体
      */
     String[] pickFields() default {};
 }
@@ -103,84 +108,21 @@ public @interface McpTool {
 
 ---
 
-### 2. 工具元数据 DTO 定义（对应 MCP Server 端要求）
-
-```java
-package com.yourcompany.erp.mcp.dto;
-
-import java.util.List;
-import java.util.Map;
-
-public class ToolMetadataDTO {
-    private String toolName;
-    private String description;
-    private boolean enabled = true;
-    private String category;
-    private Map<String, Object> inputSchema;
-    private InvocationConfig invocation;
-    private ResponseFilterConfig responseFilter;
-    private String source = "spring-boot-erp";
-
-    public static class InvocationConfig {
-        private String url;
-        private String method = "POST";
-        private int timeoutMs = 5000;
-        private Map<String, String> headers;
-
-        public String getUrl() { return url; }
-        public void setUrl(String url) { this.url = url; }
-        public String getMethod() { return method; }
-        public void setMethod(String method) { this.method = method; }
-        public int getTimeoutMs() { return timeoutMs; }
-        public void setTimeoutMs(int timeoutMs) { this.timeoutMs = timeoutMs; }
-        public Map<String, String> getHeaders() { return headers; }
-        public void setHeaders(Map<String, String> headers) { this.headers = headers; }
-    }
-
-    public static class ResponseFilterConfig {
-        private List<String> pickFields;
-        private int maxChars = 10000;
-
-        public List<String> getPickFields() { return pickFields; }
-        public void setPickFields(List<String> pickFields) { this.pickFields = pickFields; }
-        public int getMaxChars() { return maxChars; }
-        public void setMaxChars(int maxChars) { this.maxChars = maxChars; }
-    }
-
-    // Getter & Setter
-    public String getToolName() { return toolName; }
-    public void setToolName(String toolName) { this.toolName = toolName; }
-    public String getDescription() { return description; }
-    public void setDescription(String description) { this.description = description; }
-    public boolean isEnabled() { return enabled; }
-    public void setEnabled(boolean enabled) { this.enabled = enabled; }
-    public String getCategory() { return category; }
-    public void setCategory(String category) { this.category = category; }
-    public Map<String, Object> getInputSchema() { return inputSchema; }
-    public void setInputSchema(Map<String, Object> inputSchema) { this.inputSchema = inputSchema; }
-    public InvocationConfig getInvocation() { return invocation; }
-    public void setInvocation(InvocationConfig invocation) { this.invocation = invocation; }
-    public ResponseFilterConfig getResponseFilter() { return responseFilter; }
-    public void setResponseFilter(ResponseFilterConfig responseFilter) { this.responseFilter = responseFilter; }
-    public String getSource() { return source; }
-    public void setSource(String source) { this.source = source; }
-}
-```
-
----
-
-### 3. 轻量级 DTO 转 JSON Schema 工具类
+### 2. 高级 Schema 生成器（支持 JSR-303、Swagger、Enum 枚举）
 
 ```java
 package com.yourcompany.erp.mcp.util;
 
+import javax.validation.constraints.*;
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.util.*;
 
 /**
- * 将 Java DTO 类属性解析为大模型兼容的 JSON Schema 结构
+ * 深度解析 Java DTO 类，生成带约束与中文提示的高质量 JSON Schema
  */
-public class JsonSchemaGenerator {
+public class AdvancedJsonSchemaGenerator {
 
     public static Map<String, Object> generateSchema(Class<?> clazz) {
         Map<String, Object> schema = new LinkedHashMap<>();
@@ -189,34 +131,50 @@ public class JsonSchemaGenerator {
         Map<String, Object> properties = new LinkedHashMap<>();
         List<String> requiredList = new ArrayList<>();
 
-        if (clazz != null && !clazz.equals(Void.class)) {
-            Field[] fields = clazz.getDeclaredFields();
-            for (Field field : fields) {
-                String fieldName = field.getName();
-                Map<String, Object> prop = new LinkedHashMap<>();
+        if (clazz == null || clazz.equals(Void.class) || clazz.equals(void.class)) {
+            schema.put("properties", properties);
+            return schema;
+        }
 
-                Class<?> type = field.getType();
-                if (type.equals(String.class)) {
-                    prop.put("type", "string");
-                } else if (type.equals(Integer.class) || type.equals(int.class) ||
-                           type.equals(Long.class) || type.equals(long.class)) {
-                    prop.put("type", "integer");
-                } else if (type.equals(Double.class) || type.equals(double.class) ||
-                           type.equals(Float.class) || type.equals(float.class)) {
-                    prop.put("type", "number");
-                } else if (type.equals(Boolean.class) || type.equals(boolean.class)) {
-                    prop.put("type", "boolean");
-                } else if (List.class.isAssignableFrom(type) || type.isArray()) {
-                    prop.put("type", "array");
-                } else {
-                    prop.put("type", "object");
-                }
+        // 递归获取本类及父类所有字段
+        List<Field> allFields = new ArrayList<>();
+        Class<?> current = clazz;
+        while (current != null && current != Object.class) {
+            allFields.addAll(Arrays.asList(current.getDeclaredFields()));
+            current = current.getSuperclass();
+        }
 
-                // 读取说明（如兼容 Swagger 的 @Schema 或自定义描述）
-                prop.put("description", "参数: " + fieldName);
+        for (Field field : allFields) {
+            // 忽略序列化版本号
+            if ("serialVersionUID".equals(field.getName())) continue;
 
-                properties.put(fieldName, prop);
+            String fieldName = field.getName();
+            Map<String, Object> prop = parseFieldProperty(field);
+
+            // 1. 解析 JSR-303 必填注解
+            if (field.isAnnotationPresent(NotNull.class) ||
+                field.isAnnotationPresent(NotBlank.class) ||
+                field.isAnnotationPresent(NotEmpty.class)) {
+                requiredList.add(fieldName);
             }
+
+            // 2. 解析长度与范围约束
+            Size size = field.getAnnotation(Size.class);
+            if (size != null) {
+                if (size.min() > 0) prop.put("minLength", size.min());
+                if (size.max() < Integer.MAX_VALUE) prop.put("maxLength", size.max());
+            }
+
+            Min min = field.getAnnotation(Min.class);
+            if (min != null) prop.put("minimum", min.value());
+
+            Max max = field.getAnnotation(Max.class);
+            if (max != null) prop.put("maximum", max.value());
+
+            Pattern pattern = field.getAnnotation(Pattern.class);
+            if (pattern != null) prop.put("pattern", pattern.regexp());
+
+            properties.put(fieldName, prop);
         }
 
         schema.put("properties", properties);
@@ -226,26 +184,108 @@ public class JsonSchemaGenerator {
 
         return schema;
     }
+
+    private static Map<String, Object> parseFieldProperty(Field field) {
+        Map<String, Object> prop = new LinkedHashMap<>();
+        Class<?> type = field.getType();
+
+        // 提取说明（反射读取 Swagger @Schema 注解，避免直接硬编码强依赖）
+        String desc = extractDescriptionFromAnnotations(field);
+        prop.put("description", desc != null ? desc : "参数: " + field.getName());
+
+        // 枚举类型特殊处理
+        if (type.isEnum()) {
+            prop.put("type", "string");
+            Object[] enumConstants = type.getEnumConstants();
+            List<String> enumNames = new ArrayList<>();
+            for (Object ec : enumConstants) {
+                enumNames.add(ec.toString());
+            }
+            prop.put("enum", enumNames);
+            prop.put("description", prop.get("description") + " (可选枚举值: " + String.join(", ", enumNames) + ")");
+            return prop;
+        }
+
+        if (type.equals(String.class)) {
+            prop.put("type", "string");
+        } else if (type.equals(Integer.class) || type.equals(int.class) ||
+                   type.equals(Long.class) || type.equals(long.class) ||
+                   type.equals(Short.class) || type.equals(short.class)) {
+            prop.put("type", "integer");
+        } else if (type.equals(Double.class) || type.equals(double.class) ||
+                   type.equals(Float.class) || type.equals(float.class) ||
+                   type.equals(java.math.BigDecimal.class)) {
+            prop.put("type", "number");
+        } else if (type.equals(Boolean.class) || type.equals(boolean.class)) {
+            prop.put("type", "boolean");
+        } else if (List.class.isAssignableFrom(type) || Set.class.isAssignableFrom(type)) {
+            prop.put("type", "array");
+            // 提取泛型类型
+            Type genericType = field.getGenericType();
+            if (genericType instanceof ParameterizedType) {
+                Type actual = ((ParameterizedType) genericType).getActualTypeArguments()[0];
+                if (actual instanceof Class) {
+                    Class<?> itemClass = (Class<?>) actual;
+                    if (itemClass.equals(String.class)) {
+                        prop.put("items", Collections.singletonMap("type", "string"));
+                    } else if (itemClass.isEnum()) {
+                        Map<String, Object> itemSchema = new LinkedHashMap<>();
+                        itemSchema.put("type", "string");
+                        List<String> enums = new ArrayList<>();
+                        for (Object o : itemClass.getEnumConstants()) enums.add(o.toString());
+                        itemSchema.put("enum", enums);
+                        prop.put("items", itemSchema);
+                    } else {
+                        prop.put("items", generateSchema(itemClass));
+                    }
+                }
+            }
+        } else {
+            // 普通复杂嵌套对象
+            prop.put("type", "object");
+        }
+
+        return prop;
+    }
+
+    private static String extractDescriptionFromAnnotations(Field field) {
+        try {
+            // 尝试通过反射读取 io.swagger.v3.oas.annotations.media.Schema
+            for (java.lang.annotation.Annotation anno : field.getAnnotations()) {
+                String annoName = anno.annotationType().getSimpleName();
+                if ("Schema".equals(annoName) || "ApiModelProperty".equals(annoName)) {
+                    java.lang.reflect.Method descMethod = anno.annotationType().getMethod("description");
+                    String val = (String) descMethod.invoke(anno);
+                    if (val != null && !val.trim().isEmpty()) {
+                        return val;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
 }
 ```
 
 ---
 
-### 4. 自动扫描与上报核心组件 (`McpAutoReporter`)
+### 3. 全生命周期自动注册与注销器 (`McpLifecycleManager`)
+
+该类在应用**启动就绪时自动上报注册**，在**应用关机时自动注销下线**：
 
 ```java
 package com.yourcompany.erp.mcp;
 
 import com.yourcompany.erp.mcp.annotation.McpTool;
-import com.yourcompany.erp.mcp.dto.ToolMetadataDTO;
-import com.yourcompany.erp.mcp.util.JsonSchemaGenerator;
+import com.yourcompany.erp.mcp.util.AdvancedJsonSchemaGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationContext;
-import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.web.bind.annotation.*;
@@ -256,9 +296,9 @@ import java.lang.reflect.Parameter;
 import java.util.*;
 
 @Component
-public class McpAutoReporter implements ApplicationListener<ApplicationReadyEvent> {
+public class McpLifecycleManager {
 
-    private static final Logger log = LoggerFactory.getLogger(McpAutoReporter);
+    private static final Logger log = LoggerFactory.getLogger(McpLifecycleManager.class);
 
     @Value("${mcp.server.url:http://127.0.0.1:3000}")
     private String mcpServerUrl;
@@ -276,23 +316,48 @@ public class McpAutoReporter implements ApplicationListener<ApplicationReadyEven
     private ApplicationContext applicationContext;
 
     private final RestTemplate restTemplate = new RestTemplate();
+    private final List<String> registeredToolNames = new ArrayList<>();
 
-    @Override
-    public void onApplicationEvent(ApplicationReadyEvent event) {
-        log.info("[MCP] 开始扫描 Spring Boot 应用中的 @McpTool 接口...");
-        List<ToolMetadataDTO> tools = scanMcpTools();
+    /**
+     * 1. 启动事件监听：扫描所有 @McpTool 并批量注册
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        log.info("[MCP] Spring Boot 启动就绪，开始扫描带有 @McpTool 的接口...");
+        List<Map<String, Object>> tools = scanMcpTools();
 
         if (tools.isEmpty()) {
-            log.info("[MCP] 未发现任何带有 @McpTool 的接口");
+            log.info("[MCP] 未发现任何 @McpTool 接口");
             return;
         }
 
-        log.info("[MCP] 扫描完成，共发现 {} 个 MCP 工具，正在上报到 MCP Server: {}", tools.size(), mcpServerUrl);
-        reportToolsToMcpServer(tools);
+        log.info("[MCP] 发现 {} 个工具，正在批量同步至 MCP Gateway: {}", tools.size(), mcpServerUrl);
+        reportBatchTools(tools);
     }
 
-    private List<ToolMetadataDTO> scanMcpTools() {
-        List<ToolMetadataDTO> result = new ArrayList<>();
+    /**
+     * 2. 停机事件监听：服务关机时优雅注销下线
+     */
+    @EventListener(ContextClosedEvent.class)
+    public void onContextClosed() {
+        if (registeredToolNames.isEmpty()) return;
+
+        log.info("[MCP] 捕获到停机信号，正在优雅下线本节点注册的 {} 个 MCP 工具...", registeredToolNames.size());
+        for (String toolName : registeredToolNames) {
+            try {
+                HttpHeaders headers = new HttpHeaders();
+                headers.set("X-API-Key", mcpApiKey);
+                HttpEntity<Void> request = new HttpEntity<>(headers);
+                restTemplate.exchange(mcpServerUrl + "/admin/tools/" + toolName, HttpMethod.DELETE, request, String.class);
+            } catch (Exception e) {
+                log.warn("[MCP] 注销工具 '{}' 失败: {}", toolName, e.getMessage());
+            }
+        }
+        log.info("[MCP] 所有 MCP 工具已成功注销下线 👋");
+    }
+
+    private List<Map<String, Object>> scanMcpTools() {
+        List<Map<String, Object>> list = new ArrayList<>();
         Map<String, Object> controllers = applicationContext.getBeansWithAnnotation(RestController.class);
 
         for (Object bean : controllers.values()) {
@@ -320,40 +385,42 @@ public class McpAutoReporter implements ApplicationListener<ApplicationReadyEven
 
                 String fullUrl = erpCallbackHost + ":" + serverPort + basePath + subPath;
 
-                // 解析方法入参中的 RequestBody
-                Class<?> requestBodyClass = null;
+                // 提取入参中的 RequestBody
+                Class<?> bodyClass = null;
                 for (Parameter param : method.getParameters()) {
                     if (param.isAnnotationPresent(RequestBody.class)) {
-                        requestBodyClass = param.getType();
+                        bodyClass = param.getType();
                         break;
                     }
                 }
 
-                ToolMetadataDTO meta = new ToolMetadataDTO();
-                meta.setToolName(annotation.name());
-                meta.setDescription(annotation.description());
-                meta.setCategory(annotation.category());
-                meta.setInputSchema(JsonSchemaGenerator.generateSchema(requestBodyClass));
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("toolName", annotation.name());
+                meta.put("description", annotation.description());
+                meta.put("category", annotation.category());
+                meta.put("enabled", true);
+                meta.put("inputSchema", AdvancedJsonSchemaGenerator.generateSchema(bodyClass));
 
-                ToolMetadataDTO.InvocationConfig inv = new ToolMetadataDTO.InvocationConfig();
-                inv.setUrl(fullUrl);
-                inv.setMethod(httpMethod);
-                inv.setTimeoutMs(annotation.timeoutMs());
-                meta.setInvocation(inv);
+                Map<String, Object> inv = new LinkedHashMap<>();
+                inv.put("url", fullUrl);
+                inv.put("method", httpMethod);
+                inv.put("timeoutMs", annotation.timeoutMs());
+                meta.put("invocation", inv);
 
                 if (annotation.pickFields().length > 0) {
-                    ToolMetadataDTO.ResponseFilterConfig filter = new ToolMetadataDTO.ResponseFilterConfig();
-                    filter.setPickFields(Arrays.asList(annotation.pickFields()));
-                    meta.setResponseFilter(filter);
+                    Map<String, Object> filter = new LinkedHashMap<>();
+                    filter.put("pickFields", Arrays.asList(annotation.pickFields()));
+                    meta.put("responseFilter", filter);
                 }
 
-                result.add(meta);
+                list.add(meta);
+                registeredToolNames.add(annotation.name());
             }
         }
-        return result;
+        return list;
     }
 
-    private void reportToolsToMcpServer(List<ToolMetadataDTO> tools) {
+    private void reportBatchTools(List<Map<String, Object>> tools) {
         try {
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
@@ -363,16 +430,13 @@ public class McpAutoReporter implements ApplicationListener<ApplicationReadyEven
             body.put("tools", tools);
 
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
-            String registerUrl = mcpServerUrl + "/admin/tools/batch";
+            ResponseEntity<String> response = restTemplate.postForEntity(
+                mcpServerUrl + "/admin/tools/batch", request, String.class
+            );
 
-            ResponseEntity<String> response = restTemplate.postForEntity(registerUrl, request, String.class);
-            if (response.getStatusCode().is2xxSuccessful()) {
-                log.info("[MCP] 工具批量注册成功! 响应: {}", response.getBody());
-            } else {
-                log.error("[MCP] 工具注册失败，HTTP 状态码: {}", response.getStatusCode());
-            }
+            log.info("[MCP] 工具批量注册成功! 响应: {}", response.getBody());
         } catch (Exception e) {
-            log.error("[MCP] 无法连接到 MCP Server 上报接口，请检查服务是否就绪: {}", e.getMessage());
+            log.error("[MCP] 无法连接到 MCP Gateway，请检查网关是否已启动: {}", e.getMessage());
         }
     }
 }
@@ -380,119 +444,109 @@ public class McpAutoReporter implements ApplicationListener<ApplicationReadyEven
 
 ---
 
-## 四、 业务 Controller 使用示例（开发标准示范）
+## 四、 规范实战示例（Controller 与 DTO）
 
-在具体的 ERP 业务模块中，新建或编写 Controller：
+使用标准注解，模型将获得极致精准的提示与边界约束：
 
 ```java
 package com.yourcompany.erp.controller.mcp;
 
 import com.yourcompany.erp.mcp.annotation.McpTool;
+import io.swagger.v3.oas.annotations.media.Schema;
+import javax.validation.constraints.*;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api/mcp")
-public class ErpMcpToolsController {
+@RequestMapping("/api/mcp/order")
+public class OrderMcpController {
 
-    // 1. 查询物料库存工具
     @McpTool(
-        name = "query_inventory_stock",
-        description = "根据物料编码查询 ERP 系统中的当前可用库存与仓库分布",
-        category = "inventory",
-        pickFields = {"materialCode", "availableQuantity", "warehouseName"} // 仅返回3个核心字段给大模型
+        name = "query_sales_orders",
+        description = "根据时间范围与订单状态分页查询销售订单列表",
+        category = "sales",
+        pickFields = {"total", "records"} // 裁剪冗余字段
     )
-    @PostMapping("/stock/query")
-    public InventoryResult queryStock(@RequestBody StockQueryDTO query) {
-        // 直接调用原有的 InventoryService 业务逻辑
-        return new InventoryResult(query.getMaterialCode(), 1250, "华东一号总仓");
+    @PostMapping("/query")
+    public QueryResult queryOrders(@RequestBody OrderQueryDTO query) {
+        // 直接调用底层业务 Service
+        return new QueryResult();
     }
 
-    // 2. 审批销售订单工具
-    @McpTool(
-        name = "approve_sales_order",
-        description = "对指定的 ERP 销售订单执行审批通过或驳回操作",
-        category = "sales"
-    )
-    @PostMapping("/order/approve")
-    public ApprovalResult approveOrder(@RequestBody OrderApprovalDTO dto) {
-        // 调用底层的订单审批流
-        return new ApprovalResult(dto.getOrderNo(), "SUCCESS", "审批已通过");
-    }
+    // ==========================================
+    // 高质量 DTO 设计范例
+    // ==========================================
+    public static class OrderQueryDTO {
 
-    // 专门为大模型定制的精简入参 DTO（杜绝百字段万能 Request）
-    public static class StockQueryDTO {
-        private String materialCode;
-        public String getMaterialCode() { return materialCode; }
-        public void setMaterialCode(String materialCode) { this.materialCode = materialCode; }
-    }
-
-    public static class OrderApprovalDTO {
+        @Schema(description = "物料或订单编号，例如: SO202409001", example = "SO202409001")
+        @Size(max = 32)
         private String orderNo;
-        private String reason;
+
+        @Schema(description = "订单业务状态")
+        @NotNull(message = "订单状态不可为空")
+        private OrderStatusEnum status;
+
+        @Schema(description = "分页大小，1~50之间", example = "20")
+        @Min(1)
+        @Max(50)
+        private Integer pageSize = 20;
+
+        // Getter & Setter
         public String getOrderNo() { return orderNo; }
         public void setOrderNo(String orderNo) { this.orderNo = orderNo; }
-        public String getReason() { return reason; }
-        public void setReason(String reason) { this.reason = reason; }
+        public OrderStatusEnum getStatus() { return status; }
+        public void setStatus(OrderStatusEnum status) { this.status = status; }
+        public Integer getPageSize() { return pageSize; }
+        public void setPageSize(Integer pageSize) { this.pageSize = pageSize; }
     }
 
-    public static class InventoryResult {
-        private String materialCode;
-        private int availableQuantity;
-        private String warehouseName;
-        public InventoryResult(String code, int qty, String wh) {
-            this.materialCode = code;
-            this.availableQuantity = qty;
-            this.warehouseName = wh;
-        }
-        public String getMaterialCode() { return materialCode; }
-        public int getAvailableQuantity() { return availableQuantity; }
-        public String getWarehouseName() { return warehouseName; }
+    public enum OrderStatusEnum {
+        PENDING_PAYMENT,
+        PROCESSING,
+        SHIPPED,
+        COMPLETED,
+        CANCELLED
     }
 
-    public static class ApprovalResult {
-        private String orderNo;
-        private String status;
-        private String message;
-        public ApprovalResult(String no, String s, String m) {
-            this.orderNo = no;
-            this.status = s;
-            this.message = m;
-        }
-        public String getOrderNo() { return orderNo; }
-        public String getStatus() { return status; }
-        public String getMessage() { return message; }
+    public static class QueryResult {
+        private int total = 1;
+        private String[] records = new String[]{"SO202409001 (已发货)"};
+        public int getTotal() { return total; }
+        public String[] getRecords() { return records; }
     }
 }
 ```
 
 ---
 
-## 五、 `application.yml` 配置说明
+## 五、 生成的 Schema 效果对比
 
-在 Spring Boot 的 `application.yml` 中添加 MCP 上报目标地址和安全密钥：
-
-```yaml
-mcp:
-  server:
-    # 部署在服务器上的 MCP Server 地址（如果与 ERP 在同一内网，填内网 IP）
-    url: http://192.168.1.50:3000
-    # 必须与 MCP Server 的 MCP_API_KEY 保持一致
-    api-key: mcp-secret-key-prod-2026
-  erp:
-    # MCP Server 回调调用 Java ERP 接口时的域名/内网IP
-    callback-host: http://192.168.1.20
+经过增强后，大模型端获取到的 JSON Schema 会包含完整的约束：
+```json
+{
+  "type": "object",
+  "properties": {
+    "orderNo": {
+      "type": "string",
+      "description": "物料或订单编号，例如: SO202409001",
+      "maxLength": 32
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING_PAYMENT", "PROCESSING", "SHIPPED", "COMPLETED", "CANCELLED"],
+      "description": "订单业务状态 (可选枚举值: PENDING_PAYMENT, PROCESSING, SHIPPED, COMPLETED, CANCELLED)"
+    },
+    "pageSize": {
+      "type": "integer",
+      "description": "分页大小，1~50之间",
+      "minimum": 1,
+      "maximum": 50
+    }
+  },
+  "required": ["status"]
+}
 ```
-
----
-
-## 六、 运行与验证效果
-
-1. 启动 **MCP Server**；
-2. 启动 **Spring Boot ERP** 工程；
-3. 查看 Spring Boot 控制台输出：
-   ```text
-   [MCP] 开始扫描 Spring Boot 应用中的 @McpTool 接口...
-   [MCP] 扫描完成，共发现 2 个 MCP 工具，正在上报到 MCP Server: http://192.168.1.50:3000
-   [MCP] 工具批量注册成功! 响应: {"success":true,"message":"成功批量注册 2 个工具，已触发广播"}
-   ```
-4. 此时连接到 MCP Server 的 AI 客户端（如 Claude、Cursor 等）会立即收到 `notifications/tools/list_changed`，无需重启客户端，新的两个 ERP 工具就立刻可用了！
+大模型一目了然知道：
+* `status` 是必须传的；
+* `status` 只能从 5 个枚举里选一个；
+* `pageSize` 最大只能是 50。
+**完全彻底杜绝了模型瞎编乱填导致的接口报错！**

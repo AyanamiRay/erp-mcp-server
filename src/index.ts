@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { sseRouter } from './routes/sse.js';
 import { adminRouter } from './routes/admin.js';
 import { healthRouter } from './routes/health.js';
+import { dashboardRouter } from './routes/dashboard.js';
 import { sessionManager } from './mcp/server.js';
 import { eventBus } from './bus/eventBus.js';
 
@@ -24,8 +25,9 @@ app.use((req, res, next) => {
 
 // 挂载核心路由
 app.use('/', sseRouter);              // /sse, /messages
-app.use('/admin', adminRouter);       // /admin/tools/*
+app.use('/admin', adminRouter);       // /admin/tools/*, /admin/resources/*
 app.use('/', healthRouter);           // /healthz, /status
+app.use('/', dashboardRouter);        // /dashboard (内置 Web 控制台)
 
 // 全局 404
 app.use((req, res) => {
@@ -47,6 +49,7 @@ const server = app.listen(config.port, config.host, () => {
   console.log(`📍 监听地址: http://${config.host}:${config.port}`);
   console.log(`🔗 SSE 端点: http://${config.host}:${config.port}/sse`);
   console.log(`🛠️ 管理端点: http://${config.host}:${config.port}/admin/tools`);
+  console.log(`📊 可视化控制台: http://${config.host}:${config.port}/dashboard`);
   console.log(`💓 探活端点: http://${config.host}:${config.port}/healthz`);
   console.log('====================================================');
 });

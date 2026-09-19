@@ -3,6 +3,7 @@ import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 import { ToolMetadata } from '../types/tool.js';
 import { config } from '../config.js';
+import { DataMasker } from './masker.js';
 
 // 初始化 Ajv 校验器
 const ajv = new (Ajv as any)({ allErrors: true, coerceTypes: true });
@@ -97,11 +98,14 @@ export class GenericInvoker {
       // 3. 出参过滤与精简
       const filteredResult = this.filterResponse(response.data, meta.responseFilter);
 
+      // 4. 敏感信息自动脱敏处理 (手机号/身份证/银行卡)
+      const maskedResult = DataMasker.maskData(filteredResult);
+
       return {
         content: [
           {
             type: 'text',
-            text: typeof filteredResult === 'string' ? filteredResult : JSON.stringify(filteredResult, null, 2),
+            text: typeof maskedResult === 'string' ? maskedResult : JSON.stringify(maskedResult, null, 2),
           },
         ],
       };

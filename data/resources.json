@@ -1,0 +1,10 @@
+[
+  {
+    "uri": "erp://dict/order_status",
+    "name": "ERP 订单状态枚举字典",
+    "description": "定义 ERP 系统中销售订单和采购单的标准状态码与中文业务含义对照表",
+    "mimeType": "application/json",
+    "content": "{\n  \"DRAFT\": {\n    \"code\": \"10\",\n    \"desc\": \"草稿未提交\",\n    \"editable\": true\n  },\n  \"PENDING_APPROVAL\": {\n    \"code\": \"20\",\n    \"desc\": \"待财务审批\",\n    \"editable\": false\n  },\n  \"APPROVED\": {\n    \"code\": \"30\",\n    \"desc\": \"审批通过，待出库\",\n    \"editable\": false\n  },\n  \"SHIPPED\": {\n    \"code\": \"40\",\n    \"desc\": \"已全部发货\",\n    \"editable\": false\n  },\n  \"FINISHED\": {\n    \"code\": \"50\",\n    \"desc\": \"已完成对账核销\",\n    \"editable\": false\n  },\n  \"CANCELLED\": {\n    \"code\": \"99\",\n    \"desc\": \"已作废\",\n    \"editable\": false\n  }\n}",
+    "updatedAt": "2026-09-19T02:13:20.561Z"
+  }
+]
