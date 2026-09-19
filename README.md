@@ -116,7 +116,7 @@ docker run -d --name enterprise-mcp-server \
 {
   "mcpServers": {
     "enterprise-erp": {
-      "url": "http://your-server-ip:3000/sse",
+      "url": "http://your-server-ip/sse",
       "headers": {
         "Authorization": "Bearer test-secret-key-123456"
       }
@@ -124,3 +124,4 @@ docker run -d --name enterprise-mcp-server \
   }
 }
 ```
+*(注：本地 `npm run dev` 调试时使用 `http://localhost:3000/sse`；若在 Docker 部署中启用了 SSL 证书，请配置为 `https://your-domain-or-ip/sse`)*
