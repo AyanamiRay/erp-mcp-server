@@ -12,6 +12,8 @@ import { InputSanitizer } from './sanitizer.js';
 import { LruCache, toolLruCache } from './cache.js';
 import { singleflight } from './singleflight.js';
 import { CompactFormatter } from './formatter.js';
+import { TemplateEnricher } from './enricher.js';
+import { idempotencyGuard } from './idempotency.js';
 
 // 初始化 Ajv 校验器 (开启自动类型强转 coerceTypes)
 const ajv = new (Ajv as any)({ allErrors: true, coerceTypes: true });
@@ -51,20 +53,24 @@ export interface ExecutionResult {
 
 export class GenericInvoker {
   /**
-   * 执行动态工具调用 (集成连接池、LRU缓存、Singleflight、Token压缩、W3C追踪与柔性降级)
+   * 执行动态工具调用 (集成连接池、LRU缓存、5秒防重锁、模板补全、Singleflight、Token压缩、W3C追踪与柔性降级)
    */
   public static async execute(
     meta: ToolMetadata,
     rawArgs: Record<string, any>,
     traceId: string,
-    clientName: string = 'AI Agent'
+    clientName: string = 'AI Agent',
+    sessionId: string = 'default-session'
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
     // 1. 大模型入参宽容纠错清洗 (自动规范化斜杠日期、去除首尾空格、数字字符串转换)
-    const args = InputSanitizer.sanitize(rawArgs);
+    const cleanedArgs = InputSanitizer.sanitize(rawArgs);
 
-    // 2. JSON Schema 参数校验
+    // 2. 建单模板缺省字段自动补全 (自动注入当前日期、默认币种、税率等系统字段)
+    const args = TemplateEnricher.enrich(cleanedArgs, meta.templateDefaults);
+
+    // 3. JSON Schema 参数校验
     const validate = ajv.compile(meta.inputSchema);
     const valid = validate(args);
     if (!valid) {
@@ -80,6 +86,36 @@ export class GenericInvoker {
         ],
         isError: true,
       };
+    }
+
+    // 4. Dry-Run 预校验与模拟试算模式处理
+    if (args.dryRun === true) {
+      console.log(`[Invoker] [${traceId}] 触发 Dry-Run 模拟试算与预校验模式`);
+      const previewText = `【单据预校验与试算完成 (Dry-Run 模式)】\n参数校验与模板补全通过，待提交单据明细预览如下：\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\`\n\n📌 提示：本次为试运行预检，尚未真正写入 ERP 数据库。请向用户确认明细无误后，再次正式建单。`;
+      return {
+        content: [{ type: 'text', text: previewText }],
+      };
+    }
+
+    const isReadOnly = Boolean(meta.readOnly || (meta.invocation.method || 'POST').toUpperCase() === 'GET');
+
+    // 5. 5秒业务幂等防重守卫 (针对建单/写操作，拦截连点)
+    const enableIdemp = !isReadOnly && meta.enableIdempotency !== false;
+    const idempFingerprint = idempotencyGuard.generateFingerprint(sessionId, meta.toolName, args);
+
+    if (enableIdemp) {
+      const idempCheck = idempotencyGuard.check(idempFingerprint);
+      if (idempCheck.duplicate && idempCheck.cachedResult) {
+        console.warn(`[Invoker] [${traceId}] 命中 5 秒防重连点锁，直接复用上次已创建结果`);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `【5秒业务防重拦截】检测到在 5 秒内重复提交了相同内容的单据，已自动拦截避免重复建单。\n上次已创建的单据结果如下：\n\n${idempCheck.cachedResult}`,
+            },
+          ],
+        };
+      }
     }
 
     // 3. 检查只读工具的本地内存 LRU 二级缓存 (0ms 极速返回)
@@ -104,14 +140,13 @@ export class GenericInvoker {
     }
 
     // 4. 并发请求去重 (Singleflight 机制)：相同只读请求合并执行
-    const isReadOnly = Boolean(meta.readOnly || (meta.invocation.method || 'POST').toUpperCase() === 'GET');
     if (isReadOnly) {
       return await singleflight.do(cacheKey, async () => {
-        return await this.performHttpRequest(meta, args, traceId, clientName, startTime, cacheKey);
+        return await this.performHttpRequest(meta, args, traceId, clientName, startTime, cacheKey, idempFingerprint, enableIdemp);
       });
     }
 
-    return await this.performHttpRequest(meta, args, traceId, clientName, startTime, cacheKey);
+    return await this.performHttpRequest(meta, args, traceId, clientName, startTime, cacheKey, idempFingerprint, enableIdemp);
   }
 
   /**
@@ -123,7 +158,9 @@ export class GenericInvoker {
     traceId: string,
     clientName: string,
     startTime: number,
-    cacheKey: string
+    cacheKey: string,
+    idempFingerprint: string,
+    enableIdemp: boolean
   ): Promise<ExecutionResult> {
     const invocation = meta.invocation;
     const method = (invocation.method || 'POST').toUpperCase();
@@ -160,6 +197,7 @@ export class GenericInvoker {
       'traceparent': traceparent,
       'X-Caller-Source': 'Enterprise-MCP-Gateway',
       'X-Client-Name': encodeURIComponent(clientName),
+      ...(args.dryRun ? { 'X-Dry-Run': 'true' } : {}),
       ...(invocation.headers || {}),
     };
 
@@ -225,6 +263,11 @@ export class GenericInvoker {
       // 写入只读二级缓存
       if (meta.cacheTtlMs && meta.cacheTtlMs > 0) {
         toolLruCache.set(cacheKey, formattedOutput, meta.cacheTtlMs);
+      }
+
+      // 记录 5 秒业务防重缓存 (防止连点重复建单)
+      if (enableIdemp) {
+        idempotencyGuard.record(idempFingerprint, formattedOutput);
       }
 
       // 记录调用审计

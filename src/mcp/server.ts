@@ -99,8 +99,8 @@ export class McpSessionManager {
         } as CallToolResult;
       }
 
-      // 2.3 执行工具调用 (带 clientName 审计)
-      const result = await dynamicToolRegistry.executeTool(name, args || {}, traceId);
+      // 2.3 执行工具调用 (带 clientName 审计与 sessionId 5秒防重)
+      const result = await dynamicToolRegistry.executeTool(name, args || {}, traceId, profile.name, sessionId);
       return result as CallToolResult;
     });
 

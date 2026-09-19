@@ -164,7 +164,7 @@ adminRouter.post('/tools/:toolName/test', async (req: Request, res: Response) =>
   const traceId = `test-${crypto.randomUUID().substring(0, 8)}`;
 
   const startTime = Date.now();
-  const result = await dynamicToolRegistry.executeTool(toolName, args, traceId);
+  const result = await dynamicToolRegistry.executeTool(toolName, args, traceId, 'Admin Console', 'admin-test-session');
   const costMs = Date.now() - startTime;
 
   res.json({

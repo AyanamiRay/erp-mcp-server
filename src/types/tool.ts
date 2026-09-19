@@ -69,6 +69,10 @@ export interface ToolMetadata {
   fallbackContent?: string;
   /** 是否自动将列表型数据转为紧凑 Markdown 表格以节省 Token (默认开启) */
   compactTable?: boolean;
+  /** 建单模板缺省字段自动补全配置 (支持 {{current_date}}、{{current_datetime}}、币种等) */
+  templateDefaults?: Record<string, any>;
+  /** 是否开启 5 秒内业务幂等防重连点锁 (对新建单据工具默认建议开启) */
+  enableIdempotency?: boolean;
   /** 大模型入参 JSON Schema */
   inputSchema: ToolInputSchema;
   /** 目标 ERP 系统接口调用配置 */

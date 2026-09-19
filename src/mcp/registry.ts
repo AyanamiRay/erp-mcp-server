@@ -99,7 +99,9 @@ export class DynamicToolRegistry {
   public async executeTool(
     toolName: string,
     args: Record<string, any>,
-    traceId: string
+    traceId: string,
+    clientName: string = 'AI Agent',
+    sessionId: string = 'default-session'
   ): Promise<ExecutionResult> {
     const meta = toolStorage.getTool(toolName);
     if (!meta) {
@@ -126,7 +128,7 @@ export class DynamicToolRegistry {
       };
     }
 
-    return await GenericInvoker.execute(meta, args, traceId);
+    return await GenericInvoker.execute(meta, args, traceId, clientName, sessionId);
   }
 }
 
