@@ -16,7 +16,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # ==========================================
-# 阶段 2: 生产运行阶段（轻量化镜像）
+# 阶段 2: All-in-One 生产运行阶段（Nginx + Node.js 单容器）
 # ==========================================
 FROM node:22-alpine AS runner
 
@@ -24,8 +24,11 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV HOST=0.0.0.0
+ENV HOST=127.0.0.1
 ENV DATA_DIR=/app/data
+
+# 安装运行 Nginx 与启动脚本所需的基础工具
+RUN apk add --no-cache nginx bash curl su-exec
 
 # 仅安装生产依赖
 COPY package*.json ./
@@ -34,16 +37,21 @@ RUN npm ci --omit=dev && npm cache clean --force
 # 拷贝编译产物
 COPY --from=builder /app/dist ./dist
 
-# 创建持久化数据目录并设置用户权限
-RUN mkdir -p /app/data && chown -R node:node /app
+# 拷贝 Nginx 内部反向代理配置与 All-in-One 启动守护脚本
+COPY deploy/nginx-internal.conf /etc/nginx/nginx.conf
+COPY deploy/entrypoint.sh /app/deploy/entrypoint.sh
 
-# 使用内置非 root 用户增强安全性
-USER node
+# 创建相关运行目录，修复换行符并赋予执行权限
+RUN mkdir -p /app/data /etc/nginx/conf.d /etc/nginx/certs /run/nginx /var/log/nginx && \
+    sed -i 's/\r$//' /app/deploy/entrypoint.sh && \
+    chmod +x /app/deploy/entrypoint.sh && \
+    chown -R node:node /app/data /app/dist
 
-EXPOSE 3000
+# 对外暴露 Nginx 监听的 80 (HTTP) 与 443 (HTTPS) 端口
+EXPOSE 80 443
 
-# 挂载数据卷以保存动态工具配置
+# 持久化数据卷
 VOLUME ["/app/data"]
 
-# 启动服务
-CMD ["node", "dist/index.js"]
+# 容器入口：由 entrypoint 自动拉起 Node.js 并由 Nginx 接管流量
+ENTRYPOINT ["/bin/bash", "/app/deploy/entrypoint.sh"]

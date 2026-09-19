@@ -45,25 +45,44 @@ npm run dev
 
 ---
 
-### 方式二：Docker 极简单容器部署（推荐）
+### 方式二：Docker All-in-One 单容器极简部署（推荐）
 
-整个工程无需额外安装 Redis 或 Nginx，**只需启动 1 个容器**（内存仅占约 50MB）：
+本架构采用 **All-in-One 单容器设计**：在单个轻量 Alpine 容器内同时运行 **Nginx 反向代理** 与 **Node.js MCP 核心服务**。
+- **SSE 流式深度优化**：内置 Nginx 预配置 `proxy_buffering off;` 与 3600 秒长连接超时，彻底解决网关层缓冲截断问题。
+- **动态 SSL/TLS 支持**：支持挂载 SSL 证书自适应启用 443 HTTPS，保障内网传输及 `MCP_API_KEY` 凭据安全。
+- **极低开销**：无需独立启动 Redis 或额外 Nginx 容器，单容器总内存开销仅约 60MB。
+
+#### 1. 使用 Docker Compose 启动
 
 ```bash
 cd deploy
 docker-compose up -d --build
 ```
-该命令会自动构建并启动：
-- `enterprise-mcp-server`: 独立运行在 `3000` 端口，自动使用内置单机事件总线，并将数据挂载至宿主机的 `data/` 目录。
+该命令会自动构建并启动 `enterprise-mcp-server`，监听宿主机 `80` (HTTP) 与 `443` (HTTPS) 端口。
 
-> **提示**：如果你想不用 docker-compose，也可以直接单条命令运行：
-> ```bash
-> docker run -d --name mcp-server \
->   -p 3000:3000 \
->   -v $(pwd)/data:/app/data \
->   -e MCP_API_KEY=mcp-secret-key-prod-2026 \
->   enterprise-mcp-server
-> ```
+#### 2. 直接使用 Docker 命令行启动
+
+```bash
+# 构建镜像
+docker build -t erp-mcp-server -f deploy/Dockerfile .
+
+# 启动单容器 (仅 HTTP)
+docker run -d --name enterprise-mcp-server \
+  -p 80:80 \
+  -v $(pwd)/data:/app/data \
+  -e MCP_API_KEY=mcp-secret-key-prod-2026 \
+  erp-mcp-server
+
+# (可选) 启用 HTTPS：挂载本地证书目录即可自动启用 443 端口
+docker run -d --name enterprise-mcp-server \
+  -p 80:80 -p 443:443 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/certs:/etc/nginx/certs:ro \
+  -e MCP_API_KEY=mcp-secret-key-prod-2026 \
+  erp-mcp-server
+```
+
+> **提示**：只需将 `cert.pem` 与 `key.pem`（或 `tls.crt` 与 `tls.key`）放入 `certs/` 目录，容器启动时将自动识别并加载 HTTPS 配置。
 
 ---
 

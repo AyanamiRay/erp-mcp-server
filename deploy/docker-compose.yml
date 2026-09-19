@@ -1,22 +1,30 @@
 version: '3.8'
 
 services:
-  # 极简单容器部署模式：无需 Redis，无需独立 Nginx，仅需 1 个轻量容器
-  mcp-server:
+  # ==============================================================================
+  # All-in-One 极简单容器架构 (Single-Container Architecture)
+  # 内部集成 Nginx 反向代理 (SSE优化/长连接守护) + Node.js 企业级 MCP 核心服务
+  # 无需独立部署 Redis，无需独立部署 Nginx，开箱即用，资源开销极小
+  # ==============================================================================
+  erp-mcp-server:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     container_name: enterprise-mcp-server
     restart: always
     ports:
-      - "3000:3000"
+      # 对外暴露 HTTP 端口 (如需映射宿主机其他端口，可修改为如 "8080:80")
+      - "80:80"
+      # 对外暴露 HTTPS 端口 (挂载证书后自动启用)
+      - "443:443"
     environment:
-      - PORT=3000
-      - HOST=0.0.0.0
+      # 密钥安全配置 (建议在生产环境通过 .env 注入或使用强密码)
       - MCP_API_KEY=${MCP_API_KEY:-mcp-secret-key-prod-2026}
       - DATA_DIR=/app/data
       - DEFAULT_TIMEOUT_MS=5000
-      # 未配置 REDIS_URL，服务将自动使用轻量高效的内置 Node.js EventEmitter 单机模式
+      # 未配置 REDIS_URL 时，服务自动使用内置的 EventEmitter 进程内单机模式
     volumes:
-      # 将宿主机本地 data 目录直接挂载到容器内，保证工具数据重启不丢失
+      # 1. 业务与工具元数据持久化目录
       - ../data:/app/data
+      # 2. (可选) SSL/TLS 证书目录。放入 cert.pem + key.pem 容器将自动开启 HTTPS
+      - ../certs:/etc/nginx/certs:ro

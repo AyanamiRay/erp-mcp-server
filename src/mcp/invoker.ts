@@ -40,6 +40,7 @@ const httpsAgent = new https.Agent({
 const axiosClient = axios.create({
   httpAgent,
   httpsAgent,
+  proxy: false, // 禁用系统环境变量代理，确保内网及本地调用直连，避免被宿主机代理软件返回 502
 });
 
 export interface ExecutionResult {

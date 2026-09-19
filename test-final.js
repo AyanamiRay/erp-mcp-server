@@ -1,3 +1,4 @@
+import http from 'http';
 import { keyManager } from './dist/auth/keyManager.js';
 import { auditLogger } from './dist/storage/auditLogger.js';
 import { promptRegistry } from './dist/mcp/prompts.js';
@@ -59,43 +60,54 @@ async function runFinalTests() {
   console.log('✅ MCP Prompts 业务标准 SOP 模板验证通过！\n');
 
   console.log('=== [3] 集成测试: 工具自测调用并检验调用历史审计流水 ===');
-  // 1. 注册一个只读测试工具
-  await request('/admin/tools/register', {
-    method: 'POST',
-    body: {
-      toolName: 'read_stock_item',
-      description: '查询单项物料库存',
-      category: 'inventory',
-      readOnly: true,
-      inputSchema: { type: 'object', properties: { sku: { type: 'string' } } },
-      invocation: { url: 'https://httpbin.org/post', method: 'POST' },
-    },
+  // 启动本地测试 HTTP 服务模拟下游 ERP
+  const mockServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ code: 0, msg: 'ok', data: { sku: 'SKU999888', stock: 500 } }));
   });
+  await new Promise((resolve) => mockServer.listen(3999, '127.0.0.1', resolve));
 
-  // 2. 发起一次测试调用
-  const testCallRes = await request('/admin/tools/read_stock_item/test', {
-    method: 'POST',
-    body: { sku: 'SKU999888' },
-  });
-  console.log('在线自测调用状态:', testCallRes.status, 'TraceId:', testCallRes.data.traceId, '耗时:', testCallRes.data.costMs + 'ms');
+  try {
+    // 1. 注册一个只读测试工具
+    await request('/admin/tools/register', {
+      method: 'POST',
+      body: {
+        toolName: 'read_stock_item',
+        description: '查询单项物料库存',
+        category: 'inventory',
+        readOnly: true,
+        inputSchema: { type: 'object', properties: { sku: { type: 'string' } } },
+        invocation: { url: 'http://127.0.0.1:3999/stock', method: 'POST' },
+      },
+    });
 
-  // 3. 检查审计账本接口 GET /admin/audits
-  const auditsRes = await request('/admin/audits?limit=5');
-  console.log('审计账本记录数:', auditsRes.data.count);
-  const latest = auditsRes.data.data[0];
-  console.log('最新审计记录:', latest.toolName, latest.traceId, latest.success ? '成功' : '失败');
+    // 2. 发起一次测试调用
+    const testCallRes = await request('/admin/tools/read_stock_item/test', {
+      method: 'POST',
+      body: { sku: 'SKU999888' },
+    });
+    console.log('在线自测调用状态:', testCallRes.status, 'TraceId:', testCallRes.data.traceId, '耗时:', testCallRes.data.costMs + 'ms');
 
-  if (!latest || latest.toolName !== 'read_stock_item' || !latest.success) {
-    throw new Error('调用审计记录落盘失败');
+    // 3. 检查审计账本接口 GET /admin/audits
+    const auditsRes = await request('/admin/audits?limit=5');
+    console.log('审计账本记录数:', auditsRes.data.count);
+    const latest = auditsRes.data.data[0];
+    console.log('最新审计记录:', latest.toolName, latest.traceId, latest.success ? '成功' : '失败');
+
+    if (!latest || latest.toolName !== 'read_stock_item' || !latest.success) {
+      throw new Error('调用审计记录落盘失败');
+    }
+    console.log('✅ 全链路调用历史审计流水验证通过！\n');
+
+    console.log('=== [4] 集成测试: 检查多租户 Key 查询接口 ===');
+    const keysRes = await request('/admin/keys');
+    console.log('已配置租户 Key 数量:', keysRes.data.count);
+    console.log('✅ 多租户管理端点验证通过！\n');
+
+    console.log('🎉 终极进阶特性（心跳保活、多租户RBAC、智能重试、审计流水、业务SOP）全部通过验证！');
+  } finally {
+    mockServer.close();
   }
-  console.log('✅ 全链路调用历史审计流水验证通过！\n');
-
-  console.log('=== [4] 集成测试: 检查多租户 Key 查询接口 ===');
-  const keysRes = await request('/admin/keys');
-  console.log('已配置租户 Key 数量:', keysRes.data.count);
-  console.log('✅ 多租户管理端点验证通过！\n');
-
-  console.log('🎉 终极进阶特性（心跳保活、多租户RBAC、智能重试、审计流水、业务SOP）全部通过验证！');
 }
 
 runFinalTests().catch((err) => {
