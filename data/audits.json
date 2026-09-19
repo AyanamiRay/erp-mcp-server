@@ -1,0 +1,14 @@
+[
+  {
+    "traceId": "test-804ebb08",
+    "clientName": "AI Agent",
+    "toolName": "read_stock_item",
+    "args": {
+      "sku": "SKU999888"
+    },
+    "costMs": 972,
+    "success": true,
+    "responseSnippet": "{\n  \"args\": {},\n  \"data\": \"{\\\"sku\\\":\\\"SKU999888\\\"}\",\n  \"files\": {},\n  \"form\": {},\n  \"headers\": {\n    \"Accept\": \"application/json, text/plain, */*\",\n    \"Accept-Encoding\": \"gzip, compress, deflate, br\",\n    \"Content-Length\": \"19\",\n    \"Content-Type\": \"application/json\",\n    \"Host\": \"httpbin.org\",\n   ",
+    "timestamp": "2026-09-19T02:20:23.868Z"
+  }
+]

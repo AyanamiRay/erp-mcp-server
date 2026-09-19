@@ -1,0 +1,33 @@
+[
+  {
+    "key": "test-secret-key-123456",
+    "name": "超级管理员 (System Admin)",
+    "role": "admin",
+    "description": "拥有对所有工具、字典及管理端点的全量最高权限",
+    "createdAt": "2026-09-19T02:20:10.214Z"
+  },
+  {
+    "key": "sk-sales-agent-2026",
+    "name": "销售智能助手 (Sales Agent)",
+    "role": "client",
+    "allowedCategories": [
+      "sales",
+      "inventory",
+      "common"
+    ],
+    "description": "仅开放销售与库存查询类工具权限",
+    "createdAt": "2026-09-19T02:20:10.214Z"
+  },
+  {
+    "key": "sk-finance-agent-2026",
+    "name": "财务智能助手 (Finance Agent)",
+    "role": "client",
+    "allowedCategories": [
+      "finance",
+      "orders",
+      "common"
+    ],
+    "description": "仅开放财务与单据核算类工具权限",
+    "createdAt": "2026-09-19T02:20:10.214Z"
+  }
+]

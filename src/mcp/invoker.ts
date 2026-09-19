@@ -4,6 +4,7 @@ import addFormats from 'ajv-formats';
 import { ToolMetadata } from '../types/tool.js';
 import { config } from '../config.js';
 import { DataMasker } from './masker.js';
+import { auditLogger } from '../storage/auditLogger.js';
 
 // 初始化 Ajv 校验器
 const ajv = new (Ajv as any)({ allErrors: true, coerceTypes: true });
@@ -20,12 +21,13 @@ export interface ExecutionResult {
 
 export class GenericInvoker {
   /**
-   * 执行动态工具调用
+   * 执行动态工具调用 (带智能重试与全链路审计)
    */
   public static async execute(
     meta: ToolMetadata,
     args: Record<string, any>,
-    traceId: string
+    traceId: string,
+    clientName: string = 'AI Agent'
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
@@ -89,49 +91,92 @@ export class GenericInvoker {
       timeout,
     };
 
-    try {
-      console.log(`[Invoker] [${traceId}] 正在调用 ERP 接口: ${method} ${targetUrl}`);
-      const response = await axios(requestConfig);
-      const costMs = Date.now() - startTime;
+    const isReadOnly = Boolean(meta.readOnly || method === 'GET');
+    let response: any = null;
+    let lastError: any = null;
+
+    // 尝试执行调用（只读接口最多尝试 2 次，支持指数退避重试）
+    const maxAttempts = isReadOnly ? 2 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (attempt > 1) {
+          console.log(`[Invoker] [${traceId}] 正在对只读接口进行第 ${attempt} 次智能重试...`);
+          await new Promise((resolve) => setTimeout(resolve, 500)); // 退避等待 500ms
+        } else {
+          console.log(`[Invoker] [${traceId}] 正在调用 ERP 接口: ${method} ${targetUrl}`);
+        }
+
+        response = await axios(requestConfig);
+        break; // 请求成功，跳出循环
+      } catch (err: any) {
+        lastError = err;
+        // 如果是只读请求且还有重试机会，且属于网络类错误（超时、连接重置、502/503/504）
+        const isNetworkOr5xx = err.code === 'ECONNABORTED' || err.code === 'ECONNRESET' ||
+          (err.response && [502, 503, 504].includes(err.response.status));
+
+        if (attempt < maxAttempts && isNetworkOr5xx) {
+          console.warn(`[Invoker] [${traceId}] 第 ${attempt} 次调用遭遇偶发错误 (${err.message})，准备智能重试`);
+          continue;
+        }
+        break;
+      }
+    }
+
+    const costMs = Date.now() - startTime;
+
+    // 如果最终调用成功
+    if (response) {
       console.log(`[Invoker] [${traceId}] ERP 接口响应成功，耗时 ${costMs}ms，状态码: ${response.status}`);
 
-      // 3. 出参过滤与精简
+      // 出参过滤与精简
       const filteredResult = this.filterResponse(response.data, meta.responseFilter);
-
-      // 4. 敏感信息自动脱敏处理 (手机号/身份证/银行卡)
+      // 敏感信息自动脱敏
       const maskedResult = DataMasker.maskData(filteredResult);
+      const textOutput = typeof maskedResult === 'string' ? maskedResult : JSON.stringify(maskedResult, null, 2);
+
+      // 记录调用审计日志
+      auditLogger.log({
+        traceId,
+        clientName,
+        toolName: meta.toolName,
+        args,
+        costMs,
+        success: true,
+        responseSnippet: textOutput.substring(0, 300),
+      });
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: typeof maskedResult === 'string' ? maskedResult : JSON.stringify(maskedResult, null, 2),
-          },
-        ],
-      };
-    } catch (err: any) {
-      const costMs = Date.now() - startTime;
-      console.error(`[Invoker] [${traceId}] 调用 ERP 接口失败，耗时 ${costMs}ms:`, err.message);
-
-      let detail = err.message;
-      if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
-        detail = `ERP 接口调用超时 (超过限制 ${timeout}ms)，请稍后重试或检查接口服务健康度。`;
-      } else if (err.response) {
-        const status = err.response.status;
-        const resData = JSON.stringify(err.response.data || '');
-        detail = `ERP 接口返回 HTTP ${status}: ${resData.substring(0, 500)}`;
-      }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `[ERP 接口执行异常] ${detail}`,
-          },
-        ],
-        isError: true,
+        content: [{ type: 'text', text: textOutput }],
       };
     }
+
+    // 调用失败处理
+    console.error(`[Invoker] [${traceId}] 调用 ERP 接口失败，耗时 ${costMs}ms:`, lastError?.message);
+
+    let detail = lastError?.message || '未知网络错误';
+    if (lastError?.code === 'ECONNABORTED' || lastError?.message.includes('timeout')) {
+      detail = `ERP 接口调用超时 (超过限制 ${timeout}ms)，请稍后重试或检查接口服务健康度。`;
+    } else if (lastError?.response) {
+      const status = lastError.response.status;
+      const resData = JSON.stringify(lastError.response.data || '');
+      detail = `ERP 接口返回 HTTP ${status}: ${resData.substring(0, 500)}`;
+    }
+
+    // 记录失败审计日志
+    auditLogger.log({
+      traceId,
+      clientName,
+      toolName: meta.toolName,
+      args,
+      costMs,
+      success: false,
+      errorMsg: detail,
+    });
+
+    return {
+      content: [{ type: 'text', text: `[ERP 接口执行异常] ${detail}` }],
+      isError: true,
+    };
   }
 
   /**

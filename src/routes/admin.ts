@@ -1,6 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { dynamicToolRegistry } from '../mcp/registry.js';
 import { resourceRegistry, ResourceMetadata } from '../mcp/resources.js';
+import { promptRegistry } from '../mcp/prompts.js';
+import { auditLogger } from '../storage/auditLogger.js';
+import { keyManager } from '../auth/keyManager.js';
 import { ToolMetadata } from '../types/tool.js';
 import { config } from '../config.js';
 import crypto from 'crypto';
@@ -213,4 +216,37 @@ adminRouter.delete('/resources', (req: Request, res: Response) => {
 
   const deleted = resourceRegistry.unregisterResource(uri);
   res.json({ success: deleted, message: deleted ? `资源 '${uri}' 已移除` : '资源不存在' });
+});
+
+// ==========================================
+// 审计流水、业务 SOP 与多租户 Key 查询
+// ==========================================
+
+/**
+ * GET /admin/audits
+ * 获取历史调用审计记录
+ */
+adminRouter.get('/audits', (req: Request, res: Response) => {
+  const toolName = req.query.toolName as string | undefined;
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+  const list = auditLogger.query({ toolName, limit });
+  res.json({ success: true, count: list.length, data: list });
+});
+
+/**
+ * GET /admin/prompts
+ * 获取当前注册的业务 SOP 模板列表
+ */
+adminRouter.get('/prompts', (_req: Request, res: Response) => {
+  const list = promptRegistry.listPrompts();
+  res.json({ success: true, count: list.length, data: list });
+});
+
+/**
+ * GET /admin/keys
+ * 获取多租户 API Key 列表（脱敏）
+ */
+adminRouter.get('/keys', (_req: Request, res: Response) => {
+  const list = keyManager.listKeys();
+  res.json({ success: true, count: list.length, data: list });
 });

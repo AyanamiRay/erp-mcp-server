@@ -61,6 +61,8 @@ export interface ToolMetadata {
   enabled: boolean;
   /** 工具所属分类，便于分组管理 */
   category?: string;
+  /** 是否为只读幂等工具（只读工具遇到偶发网络波动时支持智能自动重试） */
+  readOnly?: boolean;
   /** 大模型入参 JSON Schema */
   inputSchema: ToolInputSchema;
   /** 目标 ERP 系统接口调用配置 */
