@@ -1,0 +1,26 @@
+# 依赖包
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 编译输出产物
+dist/
+build/
+
+# 本地环境变量敏感配置（切勿提交真实密钥到公网）
+.env
+.env.local
+
+# 动态运行数据与日志
+data/tools.json
+logs/
+*.log
+
+# IDE 与操作系统忽略文件
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db

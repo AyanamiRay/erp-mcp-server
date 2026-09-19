@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  # 极简单容器部署模式：无需 Redis，无需独立 Nginx，仅需 1 个轻量容器
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: enterprise-mcp-server
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - MCP_API_KEY=${MCP_API_KEY:-mcp-secret-key-prod-2026}
+      - DATA_DIR=/app/data
+      - DEFAULT_TIMEOUT_MS=5000
+      # 未配置 REDIS_URL，服务将自动使用轻量高效的内置 Node.js EventEmitter 单机模式
+    volumes:
+      # 将宿主机本地 data 目录直接挂载到容器内，保证工具数据重启不丢失
+      - ../data:/app/data
