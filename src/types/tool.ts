@@ -63,6 +63,12 @@ export interface ToolMetadata {
   category?: string;
   /** 是否为只读幂等工具（只读工具遇到偶发网络波动时支持智能自动重试） */
   readOnly?: boolean;
+  /** 内存二级缓存有效时间 (毫秒)，0 或不填则不缓存。只读工具推荐配置，如 60000 (1分钟) */
+  cacheTtlMs?: number;
+  /** 当后端 ERP 发生严重不可用故障时的柔性降级兜底内容 */
+  fallbackContent?: string;
+  /** 是否自动将列表型数据转为紧凑 Markdown 表格以节省 Token (默认开启) */
+  compactTable?: boolean;
   /** 大模型入参 JSON Schema */
   inputSchema: ToolInputSchema;
   /** 目标 ERP 系统接口调用配置 */
