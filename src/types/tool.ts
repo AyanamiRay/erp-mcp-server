@@ -52,6 +52,17 @@ export interface ResponseFilterConfig {
   maxChars?: number;
 }
 
+export interface BusinessStatusRule {
+  /** 期望的业务成功状态码 (例如 [0, 200]) */
+  successCodes?: Array<number | string>;
+  /** 业务响应中标识状态码的字段名 (例如 "code", "status", "errcode") */
+  codeField?: string;
+  /** 业务响应中标识成功/失败的布尔字段名 (例如 "success") */
+  successField?: string;
+  /** 业务响应中错误消息字段名 (例如 "msg", "message", "error") */
+  messageField?: string;
+}
+
 export interface ToolMetadata {
   /** 工具唯一英文标识（大模型函数名，符合 [a-zA-Z0-9_-]{1,64}） */
   toolName: string;
@@ -73,6 +84,8 @@ export interface ToolMetadata {
   templateDefaults?: Record<string, any>;
   /** 是否开启 5 秒内业务幂等防重连点锁 (对新建单据工具默认建议开启) */
   enableIdempotency?: boolean;
+  /** 下游 ERP 业务状态码校验规则 (防止把业务错误当做成功并缓存) */
+  businessStatusRule?: BusinessStatusRule;
   /** 大模型入参 JSON Schema */
   inputSchema: ToolInputSchema;
   /** 目标 ERP 系统接口调用配置 */
@@ -88,5 +101,9 @@ export interface ToolMetadata {
 export interface ToolChangeEvent {
   type: "REGISTER" | "UNREGISTER" | "REFRESH";
   toolName?: string;
+  /** 工具元数据 Payload (便于跨节点集群直接同步，无需依赖共享磁盘) */
+  metadata?: ToolMetadata;
+  /** 发起变更的节点 ID (防止本节点发布后自身订阅重复触发) */
+  nodeId?: string;
   timestamp: number;
 }

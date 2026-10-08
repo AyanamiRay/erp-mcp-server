@@ -13,8 +13,13 @@ export class DynamicToolRegistry {
     // 监听事件总线（不管是本节点还是 Redis 接收到的其它节点事件）
     eventBus.on('tool_change', (event: ToolChangeEvent) => {
       console.log(`[Registry] 收到工具变更通知: 类型=${event.type}, 工具=${event.toolName || 'ALL'}`);
-      // 重新从存储或缓存刷新
-      toolStorage.reloadFromDisk();
+      if (event.type === 'REGISTER' && event.metadata) {
+        toolStorage.saveToolSilently(event.metadata);
+      } else if (event.type === 'UNREGISTER' && event.toolName) {
+        toolStorage.deleteToolSilently(event.toolName);
+      } else {
+        toolStorage.reloadFromDisk();
+      }
       // 通知所有已连接的 MCP 会话广播 list_changed
       this.notifyListeners();
     });
@@ -46,6 +51,7 @@ export class DynamicToolRegistry {
     eventBus.emitToolChange({
       type: 'REGISTER',
       toolName: meta.toolName,
+      metadata: meta,
       timestamp: Date.now(),
     });
   }

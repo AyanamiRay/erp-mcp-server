@@ -14,6 +14,7 @@ import { singleflight } from './singleflight.js';
 import { CompactFormatter } from './formatter.js';
 import { TemplateEnricher } from './enricher.js';
 import { idempotencyGuard } from './idempotency.js';
+import { SsrfValidator } from '../security/ssrfValidator.js';
 
 // 初始化 Ajv 校验器 (开启自动类型强转 coerceTypes)
 const ajv = new (Ajv as any)({ allErrors: true, coerceTypes: true });
@@ -54,7 +55,7 @@ export interface ExecutionResult {
 
 export class GenericInvoker {
   /**
-   * 执行动态工具调用 (集成连接池、LRU缓存、5秒防重锁、模板补全、Singleflight、Token压缩、W3C追踪与柔性降级)
+   * 执行动态工具调用 (集成连接池、LRU缓存、并发防重锁、模板补全、Singleflight、Token压缩、W3C追踪与柔性降级)
    */
   public static async execute(
     meta: ToolMetadata,
@@ -65,8 +66,22 @@ export class GenericInvoker {
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
-    // 1. 大模型入参宽容纠错清洗 (自动规范化斜杠日期、去除首尾空格、数字字符串转换)
-    const cleanedArgs = InputSanitizer.sanitize(rawArgs);
+    // 0. SSRF 安全校验
+    const ssrfCheck = SsrfValidator.validate(meta.invocation.url);
+    if (!ssrfCheck.valid) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `[SSRF 拦截] ${ssrfCheck.error || '目标接口 URL 未通过安全审计'}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // 1. 大模型入参宽容纠错清洗 (基于 Schema 感知，防止编码单号被误转为数字)
+    const cleanedArgs = InputSanitizer.sanitize(rawArgs, meta.inputSchema);
 
     // 2. 建单模板缺省字段自动补全 (自动注入当前日期、默认币种、税率等系统字段)
     const args = TemplateEnricher.enrich(cleanedArgs, meta.templateDefaults);
@@ -100,26 +115,40 @@ export class GenericInvoker {
 
     const isReadOnly = Boolean(meta.readOnly || (meta.invocation.method || 'POST').toUpperCase() === 'GET');
 
-    // 5. 5秒业务幂等防重守卫 (针对建单/写操作，拦截连点)
+    // 5. 5秒业务幂等防重守卫 (带并发 In-Flight 锁，彻底杜绝毫秒级竞态双花重复建单)
     const enableIdemp = !isReadOnly && meta.enableIdempotency !== false;
     const idempFingerprint = idempotencyGuard.generateFingerprint(sessionId, meta.toolName, args);
 
     if (enableIdemp) {
-      const idempCheck = idempotencyGuard.check(idempFingerprint);
-      if (idempCheck.duplicate && idempCheck.cachedResult) {
-        console.warn(`[Invoker] [${traceId}] 命中 5 秒防重连点锁，直接复用上次已创建结果`);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `【5秒业务防重拦截】检测到在 5 秒内重复提交了相同内容的单据，已自动拦截避免重复建单。\n上次已创建的单据结果如下：\n\n${idempCheck.cachedResult}`,
-            },
-          ],
-        };
+      const acq = idempotencyGuard.acquire(idempFingerprint);
+      if (!acq.allowed) {
+        if (acq.status === 'PENDING') {
+          console.warn(`[Invoker] [${traceId}] 拦截到并发处理中的重复单据提交`);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `【操作进行中 409】检测到完全相同内容的单据正在向 ERP 提交处理中，请勿并发连点重复触发。`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (acq.status === 'COMPLETED' && acq.cachedResult) {
+          console.warn(`[Invoker] [${traceId}] 命中 5 秒防重连点锁，直接复用上次已创建结果`);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `【5秒业务防重拦截】检测到在 5 秒内重复提交了相同内容的单据，已自动拦截避免重复建单。\n上次已创建的单据结果如下：\n\n${acq.cachedResult}`,
+              },
+            ],
+          };
+        }
       }
     }
 
-    // 3. 检查只读工具的本地内存 LRU 二级缓存 (0ms 极速返回)
+    // 6. 检查只读工具的本地内存 LRU 二级缓存 (0ms 极速返回)
     const cacheKey = LruCache.generateKey(meta.toolName, args);
     if (meta.cacheTtlMs && meta.cacheTtlMs > 0) {
       const cached = toolLruCache.get(cacheKey);
@@ -140,7 +169,7 @@ export class GenericInvoker {
       }
     }
 
-    // 4. 并发请求去重 (Singleflight 机制)：相同只读请求合并执行
+    // 7. 并发请求去重 (Singleflight 机制)：相同只读请求合并执行
     if (isReadOnly) {
       return await singleflight.do(cacheKey, async () => {
         return await this.performHttpRequest(meta, args, traceId, clientName, startTime, cacheKey, idempFingerprint, enableIdemp);
@@ -248,7 +277,38 @@ export class GenericInvoker {
     if (response) {
       console.log(`[Invoker] [${traceId}] ERP 接口响应成功，耗时 ${costMs}ms，状态: ${response.status}`);
 
-      // 出参过滤与精简
+      // 核心检查：下游 ERP 业务状态码识别 (防止 HTTP 200 包裹业务失败被误当成功)
+      const businessErr = this.checkBusinessError(response.data, meta.businessStatusRule);
+      if (businessErr.isError) {
+        console.warn(`[Invoker] [${traceId}] 检测到 ERP 业务层报错: ${businessErr.message}`);
+
+        // 业务失败：立即释放防重锁，允许业务员或大模型修改参数后重新尝试
+        if (enableIdemp) {
+          idempotencyGuard.release(idempFingerprint);
+        }
+
+        auditLogger.log({
+          traceId,
+          clientName,
+          toolName: meta.toolName,
+          args,
+          costMs,
+          success: false,
+          errorMsg: businessErr.message,
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `[ERP 业务处理失败] ${businessErr.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 出参过滤与结构化精简
       const filteredResult = this.filterResponse(response.data, meta.responseFilter);
       // 敏感数据脱敏
       const maskedResult = DataMasker.maskData(filteredResult);
@@ -261,14 +321,14 @@ export class GenericInvoker {
         ? maskedResult
         : JSON.stringify(maskedResult, null, 2);
 
-      // 写入只读二级缓存
+      // 写入只读二级缓存 (只有业务成功才写缓存)
       if (meta.cacheTtlMs && meta.cacheTtlMs > 0) {
         toolLruCache.set(cacheKey, formattedOutput, meta.cacheTtlMs);
       }
 
-      // 记录 5 秒业务防重缓存 (防止连点重复建单)
+      // 将并发锁标记为正式完成并记录结果
       if (enableIdemp) {
-        idempotencyGuard.record(idempFingerprint, formattedOutput);
+        idempotencyGuard.resolve(idempFingerprint, formattedOutput);
       }
 
       // 记录调用审计
@@ -289,6 +349,11 @@ export class GenericInvoker {
 
     // 调用失败处理与柔性降级 (Fallback)
     console.error(`[Invoker] [${traceId}] 调用 ERP 接口失败，耗时 ${costMs}ms:`, lastError?.message);
+
+    // 失败时释放幂等锁，允许重试
+    if (enableIdemp) {
+      idempotencyGuard.release(idempFingerprint);
+    }
 
     // 检查是否有配置业务柔性降级内容
     if (meta.fallbackContent) {
@@ -337,6 +402,49 @@ export class GenericInvoker {
     };
   }
 
+  /**
+   * 识别 ERP 统一返回格式中的业务错误 (如 code != 0, success == false)
+   */
+  private static checkBusinessError(
+    data: any,
+    rule?: ToolMetadata['businessStatusRule']
+  ): { isError: boolean; message?: string } {
+    if (!data || typeof data !== 'object') {
+      return { isError: false };
+    }
+
+    // 1. 若配置了自定义业务规则
+    if (rule) {
+      if (rule.successField && data[rule.successField] === false) {
+        const msg = (rule.messageField && data[rule.messageField]) || data.message || data.msg || '业务接口返回失败';
+        return { isError: true, message: String(msg) };
+      }
+      if (rule.codeField && data[rule.codeField] !== undefined) {
+        const expectedCodes = rule.successCodes || [0, 200, '0', '200', 'SUCCESS', 'OK'];
+        if (!expectedCodes.includes(data[rule.codeField])) {
+          const msg = (rule.messageField && data[rule.messageField]) || data.message || data.msg || `业务状态码不符合预期: ${data[rule.codeField]}`;
+          return { isError: true, message: String(msg) };
+        }
+      }
+      return { isError: false };
+    }
+
+    // 2. 默认自适应常见 Java Spring Boot 统一响应格式 (Result / R / ApiResponse)
+    if (data.success === false) {
+      const msg = data.message || data.msg || data.error || '下游 ERP 系统返回业务失败';
+      return { isError: true, message: String(msg) };
+    }
+
+    if (data.code !== undefined && typeof data.code === 'number') {
+      if (data.code !== 0 && data.code !== 200) {
+        const msg = data.msg || data.message || data.error || `ERP 业务状态码异常: ${data.code}`;
+        return { isError: true, message: String(msg) };
+      }
+    }
+
+    return { isError: false };
+  }
+
   private static renderObjectTemplate(template: any, data: Record<string, any>): any {
     if (typeof template === 'string') {
       return this.renderTemplateValue(template, data);
@@ -370,6 +478,9 @@ export class GenericInvoker {
     return path.split('.').reduce((acc, part) => acc && acc[part], obj);
   }
 
+  /**
+   * 结构化过滤与截断 (保证 JSON 或表格语法完整性，防止破损截断)
+   */
   private static filterResponse(data: any, filterConfig?: ToolMetadata['responseFilter']): any {
     if (!data) return data;
     let result = data;
@@ -386,9 +497,54 @@ export class GenericInvoker {
 
     const maxChars = filterConfig?.maxChars || 10000;
     const str = typeof result === 'string' ? result : JSON.stringify(result);
-    if (str.length > maxChars) {
-      return str.substring(0, maxChars) + `... [返回结果过长，已截断前 ${maxChars} 字符]`;
+    if (str.length <= maxChars) {
+      return result;
     }
-    return result;
+
+    // 结构化保护截断 (列表型数据截断元素，防止破坏 JSON 语法)
+    if (Array.isArray(result)) {
+      let keepCount = result.length;
+      while (keepCount > 1 && JSON.stringify(result.slice(0, keepCount)).length > maxChars - 200) {
+        keepCount = Math.floor(keepCount * 0.7);
+      }
+      const truncatedList = result.slice(0, Math.max(1, keepCount));
+      return {
+        _truncated: true,
+        totalItems: result.length,
+        displayedItems: truncatedList.length,
+        hint: `返回列表总数 (${result.length} 条) 超出字符限制，已结构化保留前 ${truncatedList.length} 条。请使用条件缩小查询范围。`,
+        data: truncatedList,
+      };
+    }
+
+    if (typeof result === 'object' && result !== null) {
+      const listKey = Object.keys(result).find((k) => Array.isArray(result[k]) && result[k].length > 0);
+      if (listKey) {
+        const origList = result[listKey];
+        let keepCount = origList.length;
+        while (keepCount > 1 && JSON.stringify({ ...result, [listKey]: origList.slice(0, keepCount) }).length > maxChars - 200) {
+          keepCount = Math.floor(keepCount * 0.7);
+        }
+        const truncatedList = origList.slice(0, Math.max(1, keepCount));
+        return {
+          ...result,
+          [listKey]: truncatedList,
+          _truncated: true,
+          totalItems: origList.length,
+          displayedItems: truncatedList.length,
+          hint: `字段 '${listKey}' 列表总数 (${origList.length} 条) 超出字符限制，已结构化保留前 ${truncatedList.length} 条。`,
+        };
+      }
+    }
+
+    if (typeof result === 'string') {
+      return result.substring(0, maxChars) + `... [文本过长已截断前 ${maxChars} 字符]`;
+    }
+
+    return {
+      _truncated: true,
+      hint: `对象结构过大已截断前 ${maxChars} 字符`,
+      rawSnippet: str.substring(0, maxChars),
+    };
   }
 }

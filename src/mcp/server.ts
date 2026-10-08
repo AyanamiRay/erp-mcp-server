@@ -156,8 +156,8 @@ export class McpSessionManager {
       }
     }, 25000);
 
-    // 8. 监听全局工具热更新事件，向当前客户端推送通知
-    const cleanupListener = dynamicToolRegistry.onToolsChanged(async () => {
+    // 8. 监听全局工具、字典与 Prompt SOP 热更新事件，向客户端实时广播
+    const cleanupToolListener = dynamicToolRegistry.onToolsChanged(async () => {
       try {
         console.log(`[Session:${sessionId}] 向客户端推送 tools/list_changed 通知`);
         await server.sendToolListChanged();
@@ -165,6 +165,30 @@ export class McpSessionManager {
         console.warn(`[Session:${sessionId}] 推送 tools/list_changed 失败: ${err.message}`);
       }
     });
+
+    const cleanupResourceListener = resourceRegistry.onResourcesChanged(async () => {
+      try {
+        console.log(`[Session:${sessionId}] 向客户端推送 resources/list_changed 通知`);
+        await server.sendResourceListChanged();
+      } catch (err: any) {
+        console.warn(`[Session:${sessionId}] 推送 resources/list_changed 失败: ${err.message}`);
+      }
+    });
+
+    const cleanupPromptListener = promptRegistry.onPromptsChanged(async () => {
+      try {
+        console.log(`[Session:${sessionId}] 向客户端推送 prompts/list_changed 通知`);
+        await server.sendPromptListChanged();
+      } catch (err: any) {
+        console.warn(`[Session:${sessionId}] 推送 prompts/list_changed 失败: ${err.message}`);
+      }
+    });
+
+    const cleanupListener = () => {
+      cleanupToolListener();
+      cleanupResourceListener();
+      cleanupPromptListener();
+    };
 
     const session: ActiveSession = {
       sessionId,

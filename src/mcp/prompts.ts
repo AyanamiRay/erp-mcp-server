@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { config } from '../config.js';
+import { eventBus } from '../bus/eventBus.js';
 
 export interface PromptArgument {
   name: string;
@@ -27,10 +28,16 @@ export interface PromptMetadata {
 export class PromptRegistry {
   private filePath: string;
   private cache = new Map<string, PromptMetadata>();
+  private listeners = new Set<() => void>();
 
   constructor() {
     this.filePath = path.join(config.dataDir, 'prompts.json');
     this.init();
+
+    eventBus.on('prompt_change', () => {
+      this.reloadFromDisk();
+      this.notifyListeners();
+    });
   }
 
   private init() {
@@ -104,6 +111,52 @@ export class PromptRegistry {
     } catch (e: any) {
       console.error(`[PromptRegistry] 持久化 prompts.json 失败: ${e.message}`);
     }
+  }
+
+  public reloadFromDisk() {
+    this.cache.clear();
+    this.init();
+  }
+
+  public onPromptsChanged(listener: () => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notifyListeners() {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch (e) {
+        console.error('[PromptRegistry] 执行 Prompt 变更监听回调失败:', e);
+      }
+    }
+  }
+
+  public registerPrompt(prompt: PromptMetadata) {
+    prompt.updatedAt = new Date().toISOString();
+    this.cache.set(prompt.name, prompt);
+    this.persist();
+    eventBus.emitPromptChange({
+      type: 'REGISTER',
+      name: prompt.name,
+      timestamp: Date.now(),
+    });
+    this.notifyListeners();
+  }
+
+  public unregisterPrompt(name: string): boolean {
+    const existed = this.cache.delete(name);
+    if (existed) {
+      this.persist();
+      eventBus.emitPromptChange({
+        type: 'UNREGISTER',
+        name,
+        timestamp: Date.now(),
+      });
+      this.notifyListeners();
+    }
+    return existed;
   }
 
   public listPrompts() {

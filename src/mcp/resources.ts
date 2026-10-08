@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import { config } from '../config.js';
+import { eventBus } from '../bus/eventBus.js';
 
 export interface ResourceMetadata {
   /** 资源唯一 URI，必须符合 URI 格式，如 erp://dict/warehouses */
@@ -23,10 +24,17 @@ export interface ResourceMetadata {
 export class ResourceRegistry {
   private filePath: string;
   private cache = new Map<string, ResourceMetadata>();
+  private listeners = new Set<() => void>();
 
   constructor() {
     this.filePath = path.join(config.dataDir, 'resources.json');
     this.init();
+
+    // 监听多副本跨节点广播
+    eventBus.on('resource_change', () => {
+      this.reloadFromDisk();
+      this.notifyListeners();
+    });
   }
 
   private init() {
@@ -80,15 +88,49 @@ export class ResourceRegistry {
     }
   }
 
+  public reloadFromDisk() {
+    this.cache.clear();
+    this.init();
+  }
+
+  public onResourcesChanged(listener: () => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notifyListeners() {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch (e) {
+        console.error('[ResourceRegistry] 执行资源变更监听回调失败:', e);
+      }
+    }
+  }
+
   public registerResource(res: ResourceMetadata) {
     res.updatedAt = new Date().toISOString();
     this.cache.set(res.uri, res);
     this.persist();
+    eventBus.emitResourceChange({
+      type: 'REGISTER',
+      uri: res.uri,
+      timestamp: Date.now(),
+    });
+    this.notifyListeners();
   }
 
   public unregisterResource(uri: string): boolean {
     const existed = this.cache.delete(uri);
-    if (existed) this.persist();
+    if (existed) {
+      this.persist();
+      eventBus.emitResourceChange({
+        type: 'UNREGISTER',
+        uri,
+        timestamp: Date.now(),
+      });
+      this.notifyListeners();
+    }
     return existed;
   }
 

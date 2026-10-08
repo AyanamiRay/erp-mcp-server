@@ -21,6 +21,9 @@ export const config = {
   // 默认调用 ERP 接口的超时时间 (ms)
   defaultTimeoutMs: parseInt(process.env.DEFAULT_TIMEOUT_MS || '5000', 10),
 
+  // 是否允许调用内网/环回地址 (测试或开发模式下默认为 true，生产模式通过环境变量控制)
+  allowInternalUrls: process.env.ALLOW_INTERNAL_URLS === 'true' || process.env.NODE_ENV !== 'production',
+
   // 服务名称与版本
   serverName: process.env.MCP_SERVER_NAME || 'enterprise-erp-mcp',
   serverVersion: process.env.MCP_SERVER_VERSION || '1.0.0',

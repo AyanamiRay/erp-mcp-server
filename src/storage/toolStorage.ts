@@ -55,7 +55,20 @@ export class ToolStorage {
     this.persist();
   }
 
+  public saveToolSilently(meta: ToolMetadata): void {
+    this.cache.set(meta.toolName, meta);
+    this.persist();
+  }
+
   public deleteTool(toolName: string): boolean {
+    const existed = this.cache.delete(toolName);
+    if (existed) {
+      this.persist();
+    }
+    return existed;
+  }
+
+  public deleteToolSilently(toolName: string): boolean {
     const existed = this.cache.delete(toolName);
     if (existed) {
       this.persist();

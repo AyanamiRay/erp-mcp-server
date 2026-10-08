@@ -1,16 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { dynamicToolRegistry } from '../mcp/registry.js';
 import { resourceRegistry, ResourceMetadata } from '../mcp/resources.js';
-import { promptRegistry } from '../mcp/prompts.js';
+import { promptRegistry, PromptMetadata } from '../mcp/prompts.js';
 import { auditLogger } from '../storage/auditLogger.js';
-import { keyManager } from '../auth/keyManager.js';
+import { keyManager, ApiKeyProfile } from '../auth/keyManager.js';
 import { ToolMetadata } from '../types/tool.js';
 import { config } from '../config.js';
+import { SsrfValidator } from '../security/ssrfValidator.js';
 import crypto from 'crypto';
 
 export const adminRouter = Router();
 
-// 鉴权中间件（放行 query token 便于前端控制台通过 URL 参数鉴权）
+// 鉴权中间件（支持全局环境变量 config.apiKey，也联动校验 keyManager 中拥有 admin 权限的多租户 Key）
 function adminAuth(req: Request, res: Response, next: () => void) {
   if (!config.apiKey) return next();
 
@@ -21,11 +22,23 @@ function adminAuth(req: Request, res: Response, next: () => void) {
     ? apiKeyHeader.substring(7)
     : (apiKeyHeader as string) || queryToken;
 
-  if (token !== config.apiKey) {
-    res.status(401).json({ success: false, message: 'Unauthorized: Invalid Admin API Key' });
+  if (!token) {
+    res.status(401).json({ success: false, message: 'Unauthorized: Missing Admin API Key' });
     return;
   }
-  next();
+
+  // 1. 匹配全局主 Key
+  if (token === config.apiKey) {
+    return next();
+  }
+
+  // 2. 检查多租户租户库中是否具有 admin 角色
+  const profile = keyManager.authenticate(token);
+  if (profile && profile.role === 'admin') {
+    return next();
+  }
+
+  res.status(401).json({ success: false, message: 'Unauthorized: Invalid Admin API Key or Insufficient Permissions' });
 }
 
 adminRouter.use(adminAuth);
@@ -58,7 +71,7 @@ adminRouter.get('/tools/:toolName', (req: Request, res: Response) => {
 
 /**
  * POST /admin/tools/register
- * 注册或更新单个工具元数据（热插拔核心端点）
+ * 注册或更新单个工具元数据（热插拔核心端点，集成 SSRF 安全拦截）
  */
 adminRouter.post('/tools/register', (req: Request, res: Response) => {
   const meta = req.body as ToolMetadata;
@@ -67,6 +80,16 @@ adminRouter.post('/tools/register', (req: Request, res: Response) => {
     res.status(400).json({
       success: false,
       message: '缺少必填字段: toolName, description, invocation.url 均为必填项',
+    });
+    return;
+  }
+
+  // SSRF 安全校验
+  const ssrfCheck = SsrfValidator.validate(meta.invocation.url);
+  if (!ssrfCheck.valid) {
+    res.status(400).json({
+      success: false,
+      message: ssrfCheck.error || '目标 URL 未通过 SSRF 安全检查',
     });
     return;
   }
@@ -86,7 +109,7 @@ adminRouter.post('/tools/register', (req: Request, res: Response) => {
 
 /**
  * POST /admin/tools/batch
- * 批量注册工具（专供 Spring Boot 启动就绪时全量同步）
+ * 批量注册工具（专供 Spring Boot 启动就绪时全量同步，集成 SSRF 校验）
  */
 adminRouter.post('/tools/batch', (req: Request, res: Response) => {
   const tools = req.body.tools as ToolMetadata[];
@@ -97,8 +120,15 @@ adminRouter.post('/tools/batch', (req: Request, res: Response) => {
   }
 
   let count = 0;
+  const skipped: string[] = [];
+
   for (const meta of tools) {
     if (meta.toolName && meta.invocation?.url) {
+      const ssrfCheck = SsrfValidator.validate(meta.invocation.url);
+      if (!ssrfCheck.valid) {
+        skipped.push(`${meta.toolName}: ${ssrfCheck.error}`);
+        continue;
+      }
       if (meta.enabled === undefined) meta.enabled = true;
       dynamicToolRegistry.registerTool(meta);
       count++;
@@ -108,6 +138,8 @@ adminRouter.post('/tools/batch', (req: Request, res: Response) => {
   res.json({
     success: true,
     message: `成功批量注册 ${count} 个工具，已触发广播`,
+    skippedCount: skipped.length,
+    skippedDetails: skipped.length > 0 ? skipped : undefined,
   });
 });
 
@@ -190,7 +222,7 @@ adminRouter.get('/resources', (_req: Request, res: Response) => {
 
 /**
  * POST /admin/resources
- * 注册业务字典元数据
+ * 注册业务字典元数据 (集成 SSRF 校验)
  */
 adminRouter.post('/resources', (req: Request, res: Response) => {
   const meta = req.body as ResourceMetadata;
@@ -199,8 +231,16 @@ adminRouter.post('/resources', (req: Request, res: Response) => {
     return;
   }
 
+  if (meta.fetchUrl) {
+    const ssrfCheck = SsrfValidator.validate(meta.fetchUrl);
+    if (!ssrfCheck.valid) {
+      res.status(400).json({ success: false, message: ssrfCheck.error || 'fetchUrl 未通过 SSRF 检查' });
+      return;
+    }
+  }
+
   resourceRegistry.registerResource(meta);
-  res.json({ success: true, message: `字典资源 '${meta.name}' 注册成功`, data: meta });
+  res.json({ success: true, message: `字典资源 '${meta.name}' 注册成功，已向客户端广播`, data: meta });
 });
 
 /**
@@ -215,23 +255,12 @@ adminRouter.delete('/resources', (req: Request, res: Response) => {
   }
 
   const deleted = resourceRegistry.unregisterResource(uri);
-  res.json({ success: deleted, message: deleted ? `资源 '${uri}' 已移除` : '资源不存在' });
+  res.json({ success: deleted, message: deleted ? `资源 '${uri}' 已移除并广播通知` : '资源不存在' });
 });
 
 // ==========================================
-// 审计流水、业务 SOP 与多租户 Key 查询
+// Prompts 业务 SOP 管理
 // ==========================================
-
-/**
- * GET /admin/audits
- * 获取历史调用审计记录
- */
-adminRouter.get('/audits', (req: Request, res: Response) => {
-  const toolName = req.query.toolName as string | undefined;
-  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
-  const list = auditLogger.query({ toolName, limit });
-  res.json({ success: true, count: list.length, data: list });
-});
 
 /**
  * GET /admin/prompts
@@ -243,10 +272,99 @@ adminRouter.get('/prompts', (_req: Request, res: Response) => {
 });
 
 /**
+ * POST /admin/prompts
+ * 注册或更新业务 SOP 模板
+ */
+adminRouter.post('/prompts', (req: Request, res: Response) => {
+  const meta = req.body as PromptMetadata;
+  if (!meta || !meta.name || !meta.description || !Array.isArray(meta.messages)) {
+    res.status(400).json({ success: false, message: '缺少必填字段: name, description, messages 均为必填项' });
+    return;
+  }
+
+  promptRegistry.registerPrompt(meta);
+  res.json({ success: true, message: `Prompt 模板 '${meta.name}' 注册成功，已向客户端广播更新`, data: meta });
+});
+
+/**
+ * DELETE /admin/prompts/:name
+ * 删除业务 SOP 模板
+ */
+adminRouter.delete('/prompts/:name', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const deleted = promptRegistry.unregisterPrompt(name);
+  res.json({ success: deleted, message: deleted ? `Prompt 模板 '${name}' 已删除` : '模板不存在' });
+});
+
+// ==========================================
+// 多租户 API Key 动态管理 (闭环)
+// ==========================================
+
+/**
  * GET /admin/keys
  * 获取多租户 API Key 列表（脱敏）
  */
 adminRouter.get('/keys', (_req: Request, res: Response) => {
   const list = keyManager.listKeys();
+  res.json({ success: true, count: list.length, data: list });
+});
+
+/**
+ * POST /admin/keys
+ * 动态创建或更新多租户 API Key
+ */
+adminRouter.post('/keys', (req: Request, res: Response) => {
+  const profile = req.body as ApiKeyProfile;
+
+  if (!profile || !profile.key || !profile.name || !profile.role) {
+    res.status(400).json({
+      success: false,
+      message: '缺少必填字段: key, name, role 为必填项 (role 必须为 admin 或 client)',
+    });
+    return;
+  }
+
+  if (profile.role !== 'admin' && profile.role !== 'client') {
+    res.status(400).json({ success: false, message: "role 必须是 'admin' 或 'client'" });
+    return;
+  }
+
+  keyManager.addKey(profile);
+  res.json({
+    success: true,
+    message: `API Key '${profile.name}' 配置成功并已持久化`,
+    data: {
+      ...profile,
+      key: profile.key.substring(0, 4) + '****' + profile.key.substring(profile.key.length - 4),
+    },
+  });
+});
+
+/**
+ * DELETE /admin/keys/:key
+ * 注销/删除指定的 API Key
+ */
+adminRouter.delete('/keys/:key', (req: Request, res: Response) => {
+  const { key } = req.params;
+  const removed = keyManager.removeKey(key);
+  if (!removed) {
+    res.status(404).json({ success: false, message: '指定的 API Key 不存在' });
+    return;
+  }
+  res.json({ success: true, message: 'API Key 已成功撤销' });
+});
+
+// ==========================================
+// 审计流水查询
+// ==========================================
+
+/**
+ * GET /admin/audits
+ * 获取历史调用审计记录
+ */
+adminRouter.get('/audits', (req: Request, res: Response) => {
+  const toolName = req.query.toolName as string | undefined;
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+  const list = auditLogger.query({ toolName, limit });
   res.json({ success: true, count: list.length, data: list });
 });
